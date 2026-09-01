@@ -854,6 +854,62 @@ class TestRestApiTool:
         request_params["url"] == "https://example.com/test/123"
     )  # Path param replaced
 
+  def test_prepare_request_params_path_param_is_percent_encoded(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """A path parameter value must not be able to introduce new path
+    segments, a query string, or a fragment into the constructed URL.
+
+    This ensures security by escaping user-controlled values.
+
+    Path parameter values ultimately come from the model's tool-call
+    arguments. Without percent-encoding, a value such as '../../admin'
+    could redirect the request -- along with this tool's configured auth
+    credentials -- to an endpoint the OpenAPI spec never declared.
+    """
+    mock_operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="user_id",
+            py_name="user_id",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        )
+    ]
+    endpoint_with_path = OperationEndpoint(
+        base_url="https://example.com",
+        path="/users/{user_id}/messages",
+        method="get",
+    )
+    tool.endpoint = endpoint_with_path
+
+    # Path traversal attempt: '/' must be escaped so this cannot leave the
+    # {user_id} path segment.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "../../admin/v1/tenants"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/..%2F..%2Fadmin%2Fv1%2Ftenants/messages"
+    )
+
+    # Query/fragment smuggling attempt: '?' and '#' must be escaped so a
+    # path parameter value cannot introduce a query string or fragment.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "me?impersonate=other-user#"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/me%3Fimpersonate%3Dother-user%23/messages"
+    )
+    assert request_params["params"] == {}  # nothing smuggled into query params
+
   def test_prepare_request_params_header_param(
       self,
       sample_endpoint,
@@ -1226,7 +1282,7 @@ class TestRestApiTool:
       else:
         assert call_kwargs["verify"] == expected_verify_in_call
 
-  async def test_request_uses_no_default_timeout(
+  async def test_request_bounds_every_default_timeout_phase(
       self,
       mock_tool_context,
       sample_endpoint,
@@ -1234,11 +1290,12 @@ class TestRestApiTool:
       sample_auth_scheme,
       sample_auth_credential,
   ):
-    """Test that _request creates AsyncClient with timeout=None.
+    """Test that no phase of the default client's wait is unbounded.
 
-    httpx defaults to a 5-second timeout, which is too short for many
-    real-world API calls. Verify that we explicitly disable the timeout
-    to match the previous requests-library behavior (no timeout).
+    A peer that accepts a connection but never answers must not occupy an
+    agent invocation forever. Connection setup fails fast; the read and write
+    budgets stay generous, because httpx's own 5-second default is far too
+    short for many real-world APIs.
     """
     mock_response = mock.create_autospec(requests.Response, instance=True)
     mock_response.json.return_value = {"result": "success"}
@@ -1265,7 +1322,46 @@ class TestRestApiTool:
 
       assert mock_async_client.called
       _, call_kwargs = mock_async_client.call_args
-      assert call_kwargs["timeout"] is None
+      timeout = call_kwargs["timeout"]
+      assert isinstance(timeout, httpx.Timeout)
+      assert timeout.connect is not None
+      assert timeout.read is not None
+      assert timeout.write is not None
+      assert timeout.pool is not None
+      assert timeout.connect <= 30.0
+      assert timeout.pool <= 30.0
+      assert timeout.read >= 600.0
+      assert timeout.write >= 600.0
+
+  async def test_request_timeout_returns_normalized_error(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Test that a transport timeout becomes the tool's error response."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+    request = httpx.Request("GET", "https://example.com/test")
+
+    with patch.object(
+        httpx.AsyncClient,
+        "request",
+        AsyncMock(side_effect=httpx.ReadTimeout("timed out", request=request)),
+    ):
+      result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert "timed out" in result["error"]
+    assert "retry more than 3 times" in result["error"]
+    assert tool._detect_error_in_response(result) == "HTTP_ERROR"
 
   async def test_call_with_configure_verify(
       self,
