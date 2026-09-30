@@ -25,8 +25,8 @@ from ..agents.invocation_context import InvocationContext
 from ..agents.readonly_context import ReadonlyContext
 from ..events.event import Event
 from ..flows.llm_flows._base_llm_processor import BaseLlmRequestProcessor
-from ..flows.llm_flows.functions import handle_function_calls_async
-from ..flows.llm_flows.functions import REQUEST_EUC_FUNCTION_CALL_NAME
+from ..flows.llm_flows.tools._functions import handle_function_calls_async
+from ..flows.llm_flows.tools._functions import REQUEST_EUC_FUNCTION_CALL_NAME
 from ..models.llm_request import LlmRequest
 from ..sessions.state import State
 from .auth_credential import AuthCredential
@@ -222,6 +222,8 @@ async def _store_auth_and_collect_resume_targets(
 class _AuthLlmRequestProcessor(BaseLlmRequestProcessor):
   """Handles auth information to build the LLM request."""
 
+  name = "auth"
+
   @override
   async def run_async(
       self, invocation_context: InvocationContext, llm_request: LlmRequest
@@ -284,6 +286,13 @@ class _AuthLlmRequestProcessor(BaseLlmRequestProcessor):
           function_call.id in tools_to_resume
           for function_call in function_calls
       ]):
+        # If this tool call was authored by another agent, skip it to let
+        # that agent's own auth processor handle it. Without this check, a
+        # shared session's events could cause one agent to resume and
+        # execute a different agent's auth-gated tool call using its own
+        # (potentially differently-scoped) canonical_tools.
+        if event.author != agent.name:
+          continue
         if function_response_event := await handle_function_calls_async(
             invocation_context,
             event,
