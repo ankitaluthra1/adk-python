@@ -294,6 +294,7 @@ optional-dependencies.test = [
   "daytona>=0.191",
   "docker>=7",                                                       # For ContainerCodeExecutor tests
   "e2b>=2,<3",
+  "fsspec>=2023.3",                                                  # For FsspecArtifactService tests
   "gepa>=0.1",
   "google-antigravity>=0.1.7,<0.2",
   "google-api-python-client>=2.157,<3",
